@@ -110,6 +110,8 @@ Educational project — feel free to reuse for learning purposes.
 
 Compile:
 
-```bash
-gcc -pthread server.c -o server
-gcc client.c -o client
+bash
+make
+./bin/server
+./bin/client
+
