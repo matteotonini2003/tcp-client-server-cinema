@@ -110,7 +110,8 @@ This project strengthened my interest in **networked embedded systems and IoT-st
 
 ## License
 
-Educational project — feel free to reuse for learning purposes.
+This project is licensed under the MIT License — see the LICENSE file for details.
+
 
 ---
 
