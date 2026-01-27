@@ -66,6 +66,7 @@ From the client terminal:
 - Handles server replies
 - Supports SIGINT (CTRL+C)
 
+---
 ### Protocol
 Each request/response uses:
 
@@ -85,6 +86,25 @@ Each request/response uses:
 - Build: gcc / Makefile
 
 ---
+## Project Context
+
+Developed during the Bachelor’s degree in Electronic Engineering at the University of Pisa (Elaboration systems course).
+
+---
+## What I Learned
+
+- socket programming in C
+- designing simple application-layer protocols
+- multi-threaded server architectures
+- race-condition prevention with mutexes
+- debugging concurrent systems
+- input validation and error handling
+- file-based credential management
+
+---
+ ## License
+
+Educational project — feel free to reuse for learning purposes.
 
 ## Build & Run
 
