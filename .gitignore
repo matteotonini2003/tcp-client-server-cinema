@@ -1,0 +1,14 @@
+# binaries
+bin/
+server
+client
+
+# object files
+*.o
+
+# temp files
+*~
+*.swp
+
+# OS files
+.DS_Store
