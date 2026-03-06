@@ -51,4 +51,3 @@ ssize_t send_all(int sd, const void *buf, size_t len) {
     return (ssize_t)sent;
 }
 
-/* ... (anche qui il resto è IDENTICO al tuo client) ... */
