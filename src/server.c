@@ -1,4 +1,4 @@
-// server.c
+//---------------------------------------------------------SERVER CORRETTO-----------------------------------------------------
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,34 +18,43 @@
 #define NUM_SALE           5
 #define SEATS_PER_SALA     50
 #define MAX_NAME_LEN       256
-#define MAX_NUM_BOOKS      250
+#define MAX_NUM_BOOKS      250   // massimo numero di prenotazioni memorizzabili
 
 /* ------------------------------- STATO GLOBALE ---------------------------------- */
 
+// numero di thread ausiliari attivi
 int active_threads = 0;
 
+// posti rimanenti per ogni sala
 int rem_sits[NUM_SALE] = {SEATS_PER_SALA, SEATS_PER_SALA, SEATS_PER_SALA, SEATS_PER_SALA, SEATS_PER_SALA};
 
+// prenotazioni aperte(1)/chiuse(0) per ogni sala
 int prenotazioni[NUM_SALE] = {1, 1, 1, 1, 1};
 
+// struttura che rappresenta una prenotazione
 struct check {
-    int  num_sala;
-    char check_name[MAX_NAME_LEN];
-    int  tck;
+    int  num_sala;                         // numero della sala (1..5)
+    char check_name[MAX_NAME_LEN];         // nominativo
+    int  tck;                              // numero di posti
 };
 
+// array prenotazioni + numero attuale di prenotazioni
 struct check books[MAX_NUM_BOOKS];
 int books_count = 0;
 
 /* ------------------------------- SINCRONIZZAZIONE ---------------------------------- */
 
+// mutex per numero thread attivi + condition
 pthread_mutex_t threads_mtx;
 pthread_cond_t  threads_cnd;
 
+// mutex per lo stato globale (rem_sits, prenotazioni, books, books_count)
 pthread_mutex_t state_mtx;
 
+// mutex per accesso al file password
 pthread_mutex_t file_mtx;
 
+// FILE* condiviso per password.txt (aperto/chiuso volta per volta)
 FILE *fp = NULL;
 
 /* ------------------------------- STRUTTURA ARGOMENTI THREAD ---------------------------------- */
@@ -57,6 +66,7 @@ struct t_args {
 
 /* ------------------------------- FUNZIONI DI SUPPORTO ---------------------------------- */
 
+// riceve esattamente "len" byte (ritorna 0 se connessione chiusa, -1 se errore)
 ssize_t recv_all(int sd, void *buf, size_t len) {
     size_t received = 0;
     char *p = buf;
@@ -66,12 +76,13 @@ ssize_t recv_all(int sd, void *buf, size_t len) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (r == 0) return 0;
+        if (r == 0) return 0;   // connessione chiusa
         received += (size_t)r;
     }
     return (ssize_t)received;
 }
 
+// invia esattamente "len" byte (ritorna -1 se errore)
 ssize_t send_all(int sd, const void *buf, size_t len) {
     size_t sent = 0;
     const char *p = buf;
@@ -84,4 +95,699 @@ ssize_t send_all(int sd, const void *buf, size_t len) {
         sent += (size_t)s;
     }
     return (ssize_t)sent;
+}
+
+// legge password di amministratore dal file password.txt
+int read_admin_password(char *password, size_t maxlen) {
+    int ret = -1;
+    pthread_mutex_lock(&file_mtx);
+
+    fp = fopen("password.txt", "r");
+    if (fp == NULL) {
+        fprintf(stderr, "Impossibile aprire password.txt per lettura: %s\n", strerror(errno));
+        pthread_mutex_unlock(&file_mtx);
+        return -1;
+    }
+    if (fgets(password, (int)maxlen, fp) == NULL) {
+        fclose(fp);
+        pthread_mutex_unlock(&file_mtx);
+        return -1;
+    }
+    fclose(fp);
+    pthread_mutex_unlock(&file_mtx);
+
+    // togli eventuale '\n'
+    password[strcspn(password, "\n")] = '\0';
+    ret = 0;
+    return ret;
+}
+
+// scrive nuova password sul file
+int write_admin_password(const char *password) {
+    int ret = -1;
+    pthread_mutex_lock(&file_mtx);
+
+    fp = fopen("password.txt", "w");
+    if (fp == NULL) {
+        fprintf(stderr, "Impossibile aprire password.txt per scrittura: %s\n", strerror(errno));
+        pthread_mutex_unlock(&file_mtx);
+        return -1;
+    }
+    fputs(password, fp);
+    fclose(fp);
+
+    pthread_mutex_unlock(&file_mtx);
+    ret = 0;
+    return ret;
+}
+
+/* ------------------------------- GESTIONE PRENOTAZIONI ---------------------------------- */
+
+// aggiunge una prenotazione (assume state_mtx già acquisito)
+int add_booking(int nsala, const char *name, int nposti) {
+    if (books_count >= MAX_NUM_BOOKS) {
+        return -1;  // array pieno
+    }
+    books[books_count].num_sala = nsala;
+    snprintf(books[books_count].check_name, MAX_NAME_LEN, "%s", name);
+    books[books_count].tck = nposti;
+    books_count++;
+    return 0;
+}
+
+// cancella l'ultima prenotazione nel vettore che corrisponde a (nsala, name)
+// (assume state_mtx già acquisito)
+int cancel_booking(int nsala, const char *name, int *posti_cancellati) {
+    for (int i = books_count - 1; i >= 0; --i) {
+        if (books[i].num_sala == nsala &&
+            strcmp(books[i].check_name, name) == 0) {
+
+            *posti_cancellati = books[i].tck;
+
+            // sposto l'ultima prenotazione al posto di quella cancellata
+            if (i != books_count - 1) {
+                books[i] = books[books_count - 1];
+            }
+            books_count--;
+            return 0;
+        }
+    }
+    return -1;  // non trovata
+}
+
+// chiude e resetta una singola sala: chiude prenotazioni, cancella tutte le
+// prenotazioni associate e ripristina a SEATS_PER_SALA i posti disponibili
+// (assume state_mtx già acquisito)
+void close_and_reset_sala(int nsala) {
+    if (nsala < 1 || nsala > NUM_SALE) return;
+
+    // chiudo prenotazioni
+    prenotazioni[nsala - 1] = 0;
+
+    // cancello tutte le prenotazioni di quella sala
+    for (int i = books_count - 1; i >= 0; --i) {
+        if (books[i].num_sala == nsala) {
+            // sposto ultima prenotazione e riduco books_count
+            if (i != books_count - 1) {
+                books[i] = books[books_count - 1];
+            }
+            books_count--;
+        }
+    }
+
+    // ripristino posti disponibili
+    rem_sits[nsala - 1] = SEATS_PER_SALA;
+}
+
+// chiude e resetta tutte le sale (assume state_mtx già acquisito)
+void close_and_reset_all() {
+    for (int i = 0; i < NUM_SALE; ++i) {
+        prenotazioni[i] = 0;
+        rem_sits[i] = SEATS_PER_SALA;
+    }
+    books_count = 0;
+}
+
+/* ------------------------------- THREAD AUSILIARIO ---------------------------------- */
+
+void *aux_thread(void *arg) {
+    struct t_args *t = (struct t_args *)arg;
+    int conn_sd = t->sock_desc;
+    struct sockaddr_in client_addr = t->addr;
+    free(t);
+
+    char client_addr_str[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &client_addr.sin_addr.s_addr,
+                  client_addr_str, INET_ADDRSTRLEN) == NULL) {
+        fprintf(stderr, "Impossibile convertire l'indirizzo client: %s\n", strerror(errno));
+        strcpy(client_addr_str, "unknown");
+    }
+
+    int nsala = 0;
+    int nposti = 0;
+
+    char command[MAX_COMMAND];
+    char message[MAX_MESSAGE_LEN];
+    char temp[MAX_MESSAGE_LEN];
+    char name[MAX_NAME_LEN];
+
+    char password[MAX_PASSWORD_LEN];
+    char pass_input[MAX_PASSWORD_LEN];
+    char new_pass[MAX_PASSWORD_LEN];
+    char pass_req[MAX_MESSAGE_LEN];
+
+    while (1) {
+        // reset variabili locali
+        nsala = 0;
+        nposti = 0;
+        memset(command, 0, sizeof(command));
+        memset(message, 0, sizeof(message));
+        memset(temp, 0, sizeof(temp));
+        memset(name, 0, sizeof(name));
+        memset(password, 0, sizeof(password));
+        memset(pass_input, 0, sizeof(pass_input));
+        memset(new_pass, 0, sizeof(new_pass));
+        memset(pass_req, 0, sizeof(pass_req));
+
+        // ---------------- RICEZIONE nsala ----------------
+        uint32_t nsala_net;
+        ssize_t r = recv_all(conn_sd, &nsala_net, sizeof(nsala_net));
+        if (r <= 0) {   // errore o client chiuso
+            break;
+        }
+        nsala = (int)ntohl(nsala_net);
+
+        // ---------------- RICEZIONE nposti ----------------
+        uint32_t nposti_net;
+        r = recv_all(conn_sd, &nposti_net, sizeof(nposti_net));
+        if (r <= 0) {
+            break;
+        }
+        nposti = (int)ntohl(nposti_net);
+
+        // ---------------- RICEZIONE lunghezza comando ----------------
+        uint32_t len_net;
+        r = recv_all(conn_sd, &len_net, sizeof(len_net));
+        if (r <= 0) {
+            break;
+        }
+        int len = (int)ntohl(len_net);
+
+        if (len <= 0 || len >= MAX_COMMAND) {
+            // comando invalido -> invio errore e continuo
+            snprintf(message, sizeof(message),
+                     "Comando non valido (lunghezza errata).\n");
+            uint32_t msg_len_net = htonl((uint32_t)strlen(message));
+            if (send_all(conn_sd, &msg_len_net, sizeof(msg_len_net)) < 0 ||
+                send_all(conn_sd, message, strlen(message)) < 0) {
+                break;
+            }
+            continue;
+        }
+
+        // ---------------- RICEZIONE comando ----------------
+        r = recv_all(conn_sd, command, (size_t)len);
+        if (r <= 0) {
+            break;
+        }
+        command[len] = '\0';
+        command[strcspn(command, "\n")] = '\0';
+
+        // ---------------- GESTIONE COMANDO ----------------
+
+        // quit
+        if (strncmp(command, "quit", 4) == 0) {
+            snprintf(message, sizeof(message), "\n> Disconnesso\n");
+            printf("THREAD [%s:%d]: ricevuto comando %s\n",
+                   client_addr_str, ntohs(client_addr.sin_port), command);
+            uint32_t msg_len_net = htonl((uint32_t)strlen(message));
+            if (send_all(conn_sd, &msg_len_net, sizeof(msg_len_net)) < 0 ||
+                send_all(conn_sd, message, strlen(message)) < 0) {
+                // anche se fallisce l'invio, esco uguale
+            }
+            break;
+        }
+
+        // help
+        else if (strncmp(command, "help", 4) == 0) {
+            snprintf(message, sizeof(message),
+                     "\nComandi disponibili: \n"
+                     "help:\n--> mostra l’elenco dei comandi disponibili\n"
+                     "view [sala]\n--> mostra i posti disponibili nella sala specificata\n"
+                     "book [sala] [nposti]\n--> prenota il numero di posti specificato nella sala indicata\n"
+                     "cancel [sala]\n--> cancella i posti prenotati dall’utente nella sala indicata\n"
+                     "open [sala]\n--> apre le prenotazioni nella sala indicata (solo admin)\n"
+                     "close [sala]\n--> chiude le prenotazioni nella sala indicata e cancella le prenotazioni esistenti (solo admin)\n"
+                     "changepwd\n--> cambia la password di amministratore (solo admin)\n"
+                     "quit\n--> disconnessione\n");
+            printf("THREAD [%s:%d]: ricevuto comando %s\n",
+                   client_addr_str, ntohs(client_addr.sin_port), command);
+        }
+
+        // view [sala]
+        else if (strncmp(command, "view", 4) == 0) {
+            pthread_mutex_lock(&state_mtx);
+            if (nsala > 0 && nsala <= NUM_SALE) {
+                if (prenotazioni[nsala - 1]) {
+                    snprintf(message, sizeof(message),
+                             "Posti disponibili nella sala %d: %d\n",
+                             nsala, rem_sits[nsala - 1]);
+                } else {
+                    snprintf(message, sizeof(message),
+                             "Sala %d: prenotazioni chiuse\n", nsala);
+                }
+            } else if (nsala == 0) {
+                // tutte le sale
+                for (int i = 0; i < NUM_SALE; ++i) {
+                    if (prenotazioni[i]) {
+                        snprintf(temp, sizeof(temp),
+                                 "Posti disponibili nella sala %d: %d\n",
+                                 i + 1, rem_sits[i]);
+                    } else {
+                        snprintf(temp, sizeof(temp),
+                                 "Sala %d: prenotazioni chiuse\n", i + 1);
+                    }
+                    strncat(message, temp, sizeof(message) - strlen(message) - 1);
+                }
+            } else {
+                snprintf(message, sizeof(message), "Sala inesistente\n");
+            }
+            pthread_mutex_unlock(&state_mtx);
+
+            if (nsala >= 0 && nsala <= NUM_SALE) {
+                printf("THREAD [%s:%d]: ricevuto comando %s\n",
+                       client_addr_str, ntohs(client_addr.sin_port), command);
+            }
+        }
+
+        // book [sala] [nposti]
+        else if (strncmp(command, "book", 4) == 0) {
+            if (nsala <= 0 || nsala > NUM_SALE) {
+                snprintf(message, sizeof(message), "Sala inesistente\n");
+            } else if (nposti <= 0) {
+                snprintf(message, sizeof(message),
+                         "Specificare il numero di posti\n");
+            } else {
+                // controllo disponibilità e prenotazioni aperte
+                pthread_mutex_lock(&state_mtx);
+                if (!prenotazioni[nsala - 1]) {
+                    pthread_mutex_unlock(&state_mtx);
+                    snprintf(message, sizeof(message),
+                             "Le prenotazioni nella sala specificata sono chiuse!\n");
+                } else if (nposti > rem_sits[nsala - 1]) {
+                    pthread_mutex_unlock(&state_mtx);
+                    snprintf(message, sizeof(message),
+                             "Non ci sono abbastanza posti disponibili nella sala specificata!\n");
+                } else if (books_count >= MAX_NUM_BOOKS) {
+                    pthread_mutex_unlock(&state_mtx);
+                    snprintf(message, sizeof(message),
+                             "Numero massimo di prenotazioni raggiunto!\n");
+                } else {
+                    // c'è spazio: prima sblocco mutex, poi ricevo nome, poi rilavoro in sezione critica
+                    pthread_mutex_unlock(&state_mtx);
+
+                    // ricevo lunghezza nome
+                    uint32_t name_len_net;
+                    r = recv_all(conn_sd, &name_len_net, sizeof(name_len_net));
+                    if (r <= 0) {
+                        break;
+                    }
+                    int name_len = (int)ntohl(name_len_net);
+                    if (name_len <= 0 || name_len >= MAX_NAME_LEN) {
+                        snprintf(message, sizeof(message),
+                                 "Nome non valido.\n");
+                    } else {
+                        r = recv_all(conn_sd, name, (size_t)name_len);
+                        if (r <= 0) {
+                            break;
+                        }
+                        name[name_len] = '\0';
+                        name[strcspn(name, "\n")] = '\0';
+
+                        pthread_mutex_lock(&state_mtx);
+                        if (!prenotazioni[nsala - 1]) {
+                            // nel frattempo qualcuno ha chiuso la sala
+                            snprintf(message, sizeof(message),
+                                     "Le prenotazioni nella sala specificata sono chiuse!\n");
+                        } else if (nposti > rem_sits[nsala - 1]) {
+                            snprintf(message, sizeof(message),
+                                     "Non ci sono abbastanza posti disponibili nella sala specificata!\n");
+                        } else if (books_count >= MAX_NUM_BOOKS) {
+                            snprintf(message, sizeof(message),
+                                     "Numero massimo di prenotazioni raggiunto!\n");
+                        } else {
+                            // effettuo prenotazione
+                            add_booking(nsala, name, nposti);
+                            rem_sits[nsala - 1] -= nposti;
+                            snprintf(message, sizeof(message),
+                                     "> Prenotazione effettuata [Sala: %d, Posti: %d, Nominativo: %s]\n",
+                                     nsala, nposti, name);
+                            printf("THREAD [%s:%d]: ricevuto comando %s\n",
+                                   client_addr_str, ntohs(client_addr.sin_port), command);
+                        }
+                        pthread_mutex_unlock(&state_mtx);
+                    }
+                }
+            }
+        }
+
+        // cancel [sala]
+        else if (strncmp(command, "cancel", 6) == 0) {
+            if (nsala <= 0 || nsala > NUM_SALE) {
+                snprintf(message, sizeof(message), "Sala inesistente\n");
+            } else {
+                // ricevo il nome
+                uint32_t name_len_net;
+                r = recv_all(conn_sd, &name_len_net, sizeof(name_len_net));
+                if (r <= 0) {
+                    break;
+                }
+                int name_len = (int)ntohl(name_len_net);
+                if (name_len <= 0 || name_len >= MAX_NAME_LEN) {
+                    snprintf(message, sizeof(message),
+                             "Nome non valido.\n");
+                } else {
+                    r = recv_all(conn_sd, name, (size_t)name_len);
+                    if (r <= 0) {
+                        break;
+                    }
+                    name[name_len] = '\0';
+                    name[strcspn(name, "\n")] = '\0';
+
+                    int posti_canc = 0;
+                    pthread_mutex_lock(&state_mtx);
+                    if (cancel_booking(nsala, name, &posti_canc) == 0) {
+                        rem_sits[nsala - 1] += posti_canc;
+                        snprintf(message, sizeof(message),
+                                 "> Prenotazione cancellata [Sala %d, Posti %d, Nominativo: %s]\n",
+                                 nsala, posti_canc, name);
+                        printf("THREAD [%s:%d]: ricevuto comando %s\n",
+                               client_addr_str, ntohs(client_addr.sin_port), command);
+                    } else {
+                        snprintf(message, sizeof(message),
+                                 "> Non risultano prenotazioni a nome %s nella sala indicata!\n",
+                                 name);
+                    }
+                    pthread_mutex_unlock(&state_mtx);
+                }
+            }
+        }
+
+        // open [sala]
+        else if (strncmp(command, "open", 4) == 0) {
+            // lettura password admin dal file
+            if (read_admin_password(password, sizeof(password)) != 0) {
+                snprintf(message, sizeof(message),
+                         "Errore interno nella lettura della password.\n");
+            } else {
+                // ricevo password da client
+                uint32_t pass_len_net;
+                r = recv_all(conn_sd, &pass_len_net, sizeof(pass_len_net));
+                if (r <= 0) break;
+                int pass_len = (int)ntohl(pass_len_net);
+                if (pass_len <= 0 || pass_len >= MAX_PASSWORD_LEN) {
+                    snprintf(message, sizeof(message),
+                             "> Password non valida!\n");
+                } else {
+                    r = recv_all(conn_sd, pass_input, (size_t)pass_len);
+                    if (r <= 0) break;
+                    pass_input[pass_len] = '\0';
+                    pass_input[strcspn(pass_input, "\n")] = '\0';
+
+                    if (strcmp(password, pass_input) != 0) {
+                        snprintf(message, sizeof(message),
+                                 "> Password non corretta!\n");
+                    } else {
+                        pthread_mutex_lock(&state_mtx);
+                        if (nsala > 0 && nsala <= NUM_SALE) {
+                            prenotazioni[nsala - 1] = 1;
+                            snprintf(message, sizeof(message),
+                                     "> Password corretta!\n> Le prenotazioni nella sala %d sono aperte!\n",
+                                     nsala);
+                        } else if (nsala == 0) {
+                            snprintf(message, sizeof(message),
+                                     "Password corretta!\n");
+                            for (int i = 0; i < NUM_SALE; ++i) {
+                                prenotazioni[i] = 1;
+                                snprintf(temp, sizeof(temp),
+                                         "Le prenotazioni nella sala %d sono aperte!\n",
+                                         i + 1);
+                                strncat(message, temp, sizeof(message) - strlen(message) - 1);
+                            }
+                        } else {
+                            snprintf(message, sizeof(message),
+                                     "Sala inesistente\n");
+                        }
+                        pthread_mutex_unlock(&state_mtx);
+                        printf("THREAD [%s:%d]: ricevuto comando %s\n",
+                               client_addr_str, ntohs(client_addr.sin_port), command);
+                    }
+                }
+            }
+        }
+
+        // close [sala]
+        else if (strncmp(command, "close", 5) == 0) {
+            if (read_admin_password(password, sizeof(password)) != 0) {
+                snprintf(message, sizeof(message),
+                         "Errore interno nella lettura della password.\n");
+            } else {
+                // ricevo password
+                uint32_t pass_len_net;
+                r = recv_all(conn_sd, &pass_len_net, sizeof(pass_len_net));
+                if (r <= 0) break;
+                int pass_len = (int)ntohl(pass_len_net);
+                if (pass_len <= 0 || pass_len >= MAX_PASSWORD_LEN) {
+                    snprintf(message, sizeof(message),
+                             "> Password non valida!\n");
+                } else {
+                    r = recv_all(conn_sd, pass_input, (size_t)pass_len);
+                    if (r <= 0) break;
+                    pass_input[pass_len] = '\0';
+                    pass_input[strcspn(pass_input, "\n")] = '\0';
+
+                    if (strcmp(password, pass_input) != 0) {
+                        snprintf(message, sizeof(message),
+                                 "> Password non corretta!\n");
+                    } else {
+                        pthread_mutex_lock(&state_mtx);
+                        if (nsala > 0 && nsala <= NUM_SALE) {
+                            close_and_reset_sala(nsala);
+                            snprintf(message, sizeof(message),
+                                     "> Password corretta!\n> Le prenotazioni nella sala %d sono chiuse!\n",
+                                     nsala);
+                        } else if (nsala == 0) {
+                            close_and_reset_all();
+                            snprintf(message, sizeof(message),
+                                     "Password corretta!\n");
+                            for (int i = 0; i < NUM_SALE; ++i) {
+                                snprintf(temp, sizeof(temp),
+                                         "Le prenotazioni nella sala %d sono chiuse!\n",
+                                         i + 1);
+                                strncat(message, temp, sizeof(message) - strlen(message) - 1);
+                            }
+                        } else {
+                            snprintf(message, sizeof(message),
+                                     "Sala inesistente\n");
+                        }
+                        pthread_mutex_unlock(&state_mtx);
+                        printf("THREAD [%s:%d]: ricevuto comando %s\n",
+                               client_addr_str, ntohs(client_addr.sin_port), command);
+                    }
+                }
+            }
+        }
+
+        // changepwd
+        else if (strncmp(command, "changepwd", 9) == 0) {
+            if (read_admin_password(password, sizeof(password)) != 0) {
+                snprintf(message, sizeof(message),
+                         "Errore interno nella lettura della password.\n");
+            } else {
+                // ricevo vecchia password
+                uint32_t pass_len_net;
+                r = recv_all(conn_sd, &pass_len_net, sizeof(pass_len_net));
+                if (r <= 0) break;
+                int pass_len = (int)ntohl(pass_len_net);
+                if (pass_len <= 0 || pass_len >= MAX_PASSWORD_LEN) {
+                    snprintf(message, sizeof(message),
+                             "> Password non valida!\n");
+                } else {
+                    r = recv_all(conn_sd, pass_input, (size_t)pass_len);
+                    if (r <= 0) break;
+                    pass_input[pass_len] = '\0';
+                    pass_input[strcspn(pass_input, "\n")] = '\0';
+
+                    if (strcmp(password, pass_input) != 0) {
+                        snprintf(message, sizeof(message),
+                                 "> Password non corretta!\n");
+                    } else {
+                        // invio richiesta nuova password
+                        snprintf(pass_req, sizeof(pass_req),
+                                 "> Inserisci la nuova password di amministratore:\n");
+                        uint32_t req_len_net = htonl((uint32_t)strlen(pass_req));
+                        if (send_all(conn_sd, &req_len_net, sizeof(req_len_net)) < 0 ||
+                            send_all(conn_sd, pass_req, strlen(pass_req)) < 0) {
+                            break;
+                        }
+
+                        // ricevo nuova password
+                        uint32_t new_pass_len_net;
+                        r = recv_all(conn_sd, &new_pass_len_net, sizeof(new_pass_len_net));
+                        if (r <= 0) break;
+                        int new_len = (int)ntohl(new_pass_len_net);
+                        if (new_len <= 0 || new_len >= MAX_PASSWORD_LEN) {
+                            snprintf(message, sizeof(message),
+                                     "> Nuova password non valida (lunghezza errata)\n");
+                        } else {
+                            r = recv_all(conn_sd, new_pass, (size_t)new_len);
+                            if (r <= 0) break;
+                            new_pass[new_len] = '\0';
+                            new_pass[strcspn(new_pass, "\n")] = '\0';
+
+                            // verifica vincoli: almeno 8 caratteri, almeno 1 cifra, almeno 1 simbolo tra # $ % &
+                            int numbers = 0, specials = 0;
+                            size_t L = strlen(new_pass);
+                            for (size_t i = 0; i < L; ++i) {
+                                if (isdigit((unsigned char)new_pass[i])) numbers++;
+                                else if (new_pass[i] == '#' || new_pass[i] == '$' ||
+                                         new_pass[i] == '%' || new_pass[i] == '&')
+                                    specials++;
+                            }
+                            if (L < 8 || numbers < 1 || specials < 1) {
+                                snprintf(message, sizeof(message),
+                                         "> Nuova password non valida (deve contenere almeno 8 caratteri, una cifra e un simbolo speciale tra '# $ % &')\n");
+                            } else {
+                                if (write_admin_password(new_pass) != 0) {
+                                    snprintf(message, sizeof(message),
+                                             "> Errore nella modifica della password.\n");
+                                } else {
+                                    snprintf(message, sizeof(message),
+                                             "> Password modificata correttamente!\n");
+                                    printf("THREAD [%s:%d]: ricevuto comando %s\n",
+                                           client_addr_str, ntohs(client_addr.sin_port), command);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // comando errato
+        else {
+            snprintf(message, sizeof(message),
+                     "Comando errato, reinserire.\n");
+        }
+
+        // invio risposta al client
+        uint32_t msg_len_net = htonl((uint32_t)strlen(message));
+        if (send_all(conn_sd, &msg_len_net, sizeof(msg_len_net)) < 0 ||
+            send_all(conn_sd, message, strlen(message)) < 0) {
+            break;
+        }
+    }
+
+    close(conn_sd);
+
+    pthread_mutex_lock(&threads_mtx);
+    active_threads--;
+    pthread_mutex_unlock(&threads_mtx);
+    pthread_cond_signal(&threads_cnd);
+
+    pthread_exit(NULL);
+}
+
+/* ------------------------------- MAIN ---------------------------------- */
+
+int main(int argc, char *argv[]) {
+    int num_port = DEFAULT_PORT_NUMBER;
+
+    if (argc >= 2) {
+        num_port = atoi(argv[1]);
+        if (num_port <= 0 || num_port > 65535) {
+            fprintf(stderr, "Errore: numero di porta non valido (%s).\n", argv[1]);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // inizializzazione mutex e condition
+    pthread_mutex_init(&threads_mtx, NULL);
+    pthread_cond_init(&threads_cnd, NULL);
+    pthread_mutex_init(&state_mtx, NULL);
+    pthread_mutex_init(&file_mtx, NULL);
+
+    // scrivo password default all'avvio
+    if (write_admin_password("amm1n1strator&") != 0) {
+        fprintf(stderr, "Impossibile impostare la password di default.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // creazione socket
+    int sd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sd < 0) {
+        fprintf(stderr, "Impossibile creare il socket: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    int reuse_opt = 1;
+    if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &reuse_opt, sizeof(reuse_opt)) < 0) {
+        fprintf(stderr, "Warning: setsockopt SO_REUSEADDR fallita: %s\n", strerror(errno));
+    }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(num_port);
+    sa.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "Impossibile associare l'indirizzo al socket: %s\n", strerror(errno));
+        close(sd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(sd, 5) < 0) {
+        fprintf(stderr, "Impossibile mettersi in ascolto su socket: %s\n", strerror(errno));
+        close(sd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("MAIN: server avviato, in ascolto sulla porta %d\n", num_port);
+
+    while (1) {
+        pthread_mutex_lock(&threads_mtx);
+        while (active_threads >= MAX_THREAD) {
+            printf("Massimo numero di thread raggiunto... attendo\n");
+            pthread_cond_wait(&threads_cnd, &threads_mtx);
+        }
+        pthread_mutex_unlock(&threads_mtx);
+
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);
+        int conn_sd = accept(sd, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (conn_sd < 0) {
+            fprintf(stderr, "Impossibile accettare connessione su socket: %s\n", strerror(errno));
+            continue;
+        }
+
+        char client_addr_str[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &client_addr.sin_addr.s_addr,
+                      client_addr_str, INET_ADDRSTRLEN) == NULL) {
+            strcpy(client_addr_str, "unknown");
+        }
+        printf("MAIN: accettata connessione dal client %s:%d\n",
+               client_addr_str, ntohs(client_addr.sin_port));
+
+        struct t_args *thp = malloc(sizeof(struct t_args));
+        if (!thp) {
+            fprintf(stderr, "Memoria insufficiente per thread args\n");
+            close(conn_sd);
+            continue;
+        }
+        thp->sock_desc = conn_sd;
+        thp->addr = client_addr;
+
+        pthread_t th;
+        if (pthread_create(&th, NULL, aux_thread, thp) != 0) {
+            fprintf(stderr, "Impossibile creare il thread: %s\n", strerror(errno));
+            close(conn_sd);
+            free(thp);
+            continue;
+        }
+        pthread_detach(th);
+
+        pthread_mutex_lock(&threads_mtx);
+        active_threads++;
+        pthread_mutex_unlock(&threads_mtx);
+    }
+
+    // (in pratica non ci arrivi mai)
+    close(sd);
+    pthread_mutex_destroy(&threads_mtx);
+    pthread_cond_destroy(&threads_cnd);
+    pthread_mutex_destroy(&state_mtx);
+    pthread_mutex_destroy(&file_mtx);
+
+    return 0;
 }
